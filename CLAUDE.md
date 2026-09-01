@@ -21,19 +21,40 @@ modules and to the headless `logoscore` host.
   Doxygen → Breathe → Sphinx). Editing method signatures or their JSON
   payloads changes both the ABI and the docs.
 
-- **`StorageModuleImpl` calls `libstorage`** (C API, vendored at
-  `lib/libstorage.h`; source of truth is `logos-storage-nim/library/libstorage.h`).
-  libstorage functions are asynchronous: a command is dispatched to a worker
-  thread and the result arrives via a `StorageCallback`. The return code is
-  only the synchronous dispatch status (`RET_OK`/`RET_ERR`/`RET_PROGRESS`).
+- **`StorageModuleImpl` calls `libstorage`** through the typed `storage_ctx_*`
+  wrappers that [nim-ffi](https://github.com/logos-messaging/nim-ffi) generates
+  from the Nim signatures. `lib/libstorage.h` (source of truth:
+  `logos-storage-nim/library/libstorage.h`) includes `lib/generated/storage.h`,
+  a build artifact staged by the flake's `preConfigure` from the libstorage
+  package. Those wrappers encode their requests with TinyCBOR, so the plugin
+  links `tinycbor` (declared in `metadata.json`).
 
-- **Two callback patterns** in `src/storage_module_plugin.cpp`:
+  Every entry point is asynchronous and reports through a reply callback that
+  fires exactly once: synchronously when the dispatch fails, otherwise from the
+  libstorage dispatch thread.
+
+- **The nim-ffi plumbing lives in `src/ffi.h`**: the reply callbacks,
+  `asyncSend`, `SyncCtx` and the `syncCall*` helpers.
+  `src/storage_module_plugin.cpp` keeps the module logic.
+
+- **Two callback patterns:**
   - *Fire-and-forget, event-emitting* (`AsyncCallbackBase` strategy:
-    `SimpleEventCtx`, `ConnectCtx`, `UploadFileCtx`, `UploadChunkCtx`,
-    `DownloadStreamCtx`) — used by async ops; emit a named event on completion.
-  - *Blocking* (`SyncCtx` + `waitSync`) — used by synchronous getters. The
-    `abandoned` flag prevents use-after-free when the caller times out before
-    the callback fires; preserve it when touching this code.
+    `RunningEventCtx`, `ConnectCtx`, `UploadFileCtx`, `UploadChunkCtx`,
+    `FetchManifestCtx`, `RemoveCtx`): emit a named event
+    on completion.
+  - *Blocking* (`SyncCtx` + `syncCallNoArg`/`syncCallString`/`waitSync`): used
+    by synchronous getters. The `abandoned` flag prevents use-after-free when
+    the caller times out before the callback fires; preserve it when touching
+    this code.
+
+- **Transfer progress is an event, not a reply.** libstorage publishes
+  `on_upload_progress`, `on_download_chunk` and `on_download_done` on its
+  event thread;
+  `init()` registers a listener for each and the handlers match a running
+  transfer by session ID (upload) or CID (download) in the `uploads` /
+  `downloads` tables. libstorage restarts session IDs at zero for every node,
+  so a `TransferTable` keys on `(owner, id)` and owns the lock for both
+  threads.
 
 - **Return-type convention:** `init()`/`start()` return `bool` (for headless
   compatibility); everything else returns `StdLogosResult`. Async operations
